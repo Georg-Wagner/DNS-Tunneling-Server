@@ -8,7 +8,7 @@ namespace DNS_Tunneling_Server
     // done, still just to conect mit Gui (Lucas)
     class localIP
     {
-        public getNetworkInterface()
+        public void getNetworkInterface()
         {
 
 
