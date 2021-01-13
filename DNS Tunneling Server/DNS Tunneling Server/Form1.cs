@@ -31,7 +31,9 @@ namespace DNS_Tunneling_Server
 
         public static ConcurrentDictionary<string, string[]> ClientRequestHexQueue = new ConcurrentDictionary<string, string[]>();
         public static ConcurrentDictionary<string, string[]> ClientResponseDataQueue = new ConcurrentDictionary<string, string[]>();
-        public static void AddToClientRequestHexQueue(string messageID, int messageNum, int messagesCount, string recivedMessage)
+        public static ConcurrentDictionary<string, TcpClient> OpenStreams = new ConcurrentDictionary<string, TcpClient>();
+        public static ConcurrentDictionary<string, string> messageID_streamID = new ConcurrentDictionary<string, string>();
+        public static void AddToClientRequestHexQueue(string streamID, string messageID, int messageNum, int messagesCount, string recivedMessage)
         {
             string[] tmpOut = new string[] { };
             string[] tmpin = new string[] { };
@@ -40,6 +42,7 @@ namespace DNS_Tunneling_Server
             tmpOut.CopyTo(tmpin, 0);
             tmpin[messageNum] = recivedMessage;
             ClientRequestHexQueue.TryUpdate(messageID, tmpin, tmpOut);
+            //Wenn dieser Antwort vom Tunneling-Server der letzte Teil für dieses messageID ist....
             if (messagesCount - 1 == messageNum)
             {
                 var thrd = new Thread(async () =>
@@ -48,6 +51,8 @@ namespace DNS_Tunneling_Server
                 a1:
                     try
                     {
+                        // Es wird überprüft ob tatsächlich alle Teile angekommen sind
+
                         while (ClientRequestHexQueue.TryGetValue(messageID, out tmpOut) == false) ;
                         while (tmpOut.All(x => string.IsNullOrEmpty(x)))
                         {
@@ -63,7 +68,7 @@ namespace DNS_Tunneling_Server
                     Int32 port;
                     string hostHex = tmpOut[tmpOut.Length - 1];
 
-                    host = System.Text.Encoding.ASCII.GetString(HexStringToByteArray(hostHex)).Split(':')[0];
+                    host = Encoding.ASCII.GetString(HexStringToByteArray(hostHex)).Split(':')[0];
 
                     Int32.TryParse(System.Text.Encoding.ASCII.GetString(HexStringToByteArray(tmpOut[tmpOut.Length - 1])).Split(':')[1], out port);
                     string dataHex = "";
@@ -72,23 +77,55 @@ namespace DNS_Tunneling_Server
                         dataHex += tmpOut[i];
                     }
                     byte[] dataBytesToSend = HexStringToByteArray(dataHex);
-                    byte[] dataBytesRecived = new byte[] { };
+                    Console.WriteLine($"Recived from Client Size: {dataBytesToSend.Length}, streamID: {streamID} messageID: {messageID}, {host}:{port}");
+                    byte[] dataBytesRecived = new byte[8192];
                     TcpClient tcpClient = new TcpClient();
                     await tcpClient.ConnectAsync(host, port);
                     NetworkStream upstream = tcpClient.GetStream();
-                    // upstream.ReadTimeout = 3000;
-
-                    // 独立线程，完成自己的任务后消失
-                    await upstream.WriteAsync(dataBytesToSend, 0, dataBytesToSend.Length);
-                    using (MemoryStream ms = new MemoryStream())
+                    //Überprüfe ob der stream schon existiert
+                    if (!OpenStreams.ContainsKey(streamID))
                     {
-                        upstream.CopyTo(ms);
-                        dataBytesRecived = ms.ToArray();
+                        Console.WriteLine($"Connected to: {host}:{port} , streamID: {streamID} messageID: {messageID}");
+                        OpenStreams.TryAdd(streamID, tcpClient);
+                    
                     }
-                    string base64AnswerData = Convert.ToBase64String(dataBytesRecived);
-                    string[] splittedbase64AnswerData = Split(base64AnswerData, 230).ToArray();
-                    ClientResponseDataQueue.TryAdd(messageID, splittedbase64AnswerData);
+                    else
+                    {
+                     
+                        OpenStreams.TryGetValue(streamID, out tcpClient);
 
+                        Console.WriteLine($"Stream to: {host}:{port} opened, streamID: {streamID} messageID: {messageID}");
+                            upstream = tcpClient.GetStream();
+                        
+                    }
+ 
+
+                    try
+                    {
+                        await upstream.WriteAsync(dataBytesToSend, 0, dataBytesToSend.Length);
+                    }
+                    catch (Exception)
+                    {
+                        OpenStreams.TryRemove(streamID, out _ );
+                        Console.WriteLine($"Stream to: {host}:{port} Closed, streamID: {streamID} messageID: {messageID}");
+                        goto b1;
+                    }
+                    
+                    Console.WriteLine($"Data sent to: {host}:{port} Size: {dataBytesToSend.Length} streamID: {streamID} messageID: {messageID}");
+                    Console.WriteLine($"Parsing Response from: {host}:{port} streamID: {streamID} messageID: {messageID}");
+                    
+                    int countOfBytesRecived = upstream.Read(dataBytesRecived);
+                    dataBytesRecived = dataBytesRecived.Take(countOfBytesRecived).ToArray();
+           
+                    Console.WriteLine($"Recived from Server Size: {dataBytesRecived.Length}, streamID: {streamID} messageID: {messageID}, {host}:{port}");
+                    //Antwort von dem Web-Server wird in Base64 Konvertiert
+                    string base64AnswerData = Convert.ToBase64String(dataBytesRecived);
+                    //Da TXT record maximal 255 Zeichen lang sein darf, wird Antwort von dem Web-Server auf 230 Zeichen lange strings aufgeteilt. Restliche Kapazität wird für Meta Daten benutzt
+                    string[] splittedbase64AnswerData = Split(base64AnswerData, 230).ToArray();
+                    messageID_streamID.TryAdd(messageID, streamID);
+                    ClientResponseDataQueue.TryAdd(messageID, splittedbase64AnswerData);
+                    Console.WriteLine($"Added to SendQueue Size: {dataBytesRecived.Length}, streamID: {streamID} messageID: {messageID}, {host}:{port}");
+                b1:;
                 });
                 thrd.Start();
             }
@@ -106,7 +143,7 @@ namespace DNS_Tunneling_Server
                 bytes[i / 2] = Convert.ToByte(hex.Substring(i, 2), 16);
             return bytes;
         }
-        //public UdpClient listener;
+     
         public static void udpserver()
 
         {
@@ -118,41 +155,43 @@ namespace DNS_Tunneling_Server
             while (true)
 
             {
-
-
-
                 try
 
                 {
-
+                    //Empfange alle Eingehende Verbindungen auf 53 Port
                     IPEndPoint groupEP = new IPEndPoint(IPAddress.Any, 53);
                     byte[] ReciveBytes = listener.Receive(ref groupEP);
                     string domain = getDomain(ReciveBytes);
 
-                    //byte[] byteip = SubDomToIPAddr(domain);
                     string recivedMessage;
                     string messageID;
+                    string streamID;
                     int messageNum;
                     int messagesCount;
-                    PharseDomain(domain, out messageID, out messageNum, out messagesCount, out recivedMessage);
+                    
+                    PharseDomain(domain, out streamID, out messageID, out messageNum, out messagesCount, out recivedMessage);
                     if (!string.IsNullOrEmpty(recivedMessage))
                     {
                         string[] tmpOut = new string[] { };
                         string[] tmpin = new string[] { };
+                        //Wenn das der erste Teil von message ist, wird neue messageID zu ClientRequestHexQueue hinzugefügt
                         if (!ClientRequestHexQueue.TryGetValue(messageID, out tmpOut))
                         {
                             tmpOut = new string[messagesCount];
                             ClientRequestHexQueue.TryAdd(messageID, tmpOut);
 
                         }
-                        AddToClientRequestHexQueue(messageID, messageNum, messagesCount, recivedMessage);
+                        AddToClientRequestHexQueue(streamID, messageID, messageNum, messagesCount, recivedMessage);
 
                     }
-                    string strmessage1 = "null";
+                    string strmessage = "null";
                     string responseData = "null";
+                    //Es wird der erster Antwort von dem Web-Server aus der Schlange genommen und für versand als DNS TXT Record vorbereitet
                     if (!ClientResponseDataQueue.IsEmpty)
                     {
                         string msgIdTmp = ClientResponseDataQueue.First().Key;
+                        string strmIdTmp = "";
+                        messageID_streamID.TryGetValue(msgIdTmp, out strmIdTmp);
                         string[] splittedResponseData = ClientResponseDataQueue.First().Value;
                         for (int i = 0; i < splittedResponseData.Length; i++)
                         {
@@ -160,7 +199,7 @@ namespace DNS_Tunneling_Server
                             {
                                 responseData = splittedResponseData[i];
 
-                                strmessage1 = $"[{msgIdTmp}.{i}-{splittedResponseData.Length}]{responseData}";
+                                strmessage = $"[{msgIdTmp}-{strmIdTmp}.{i}-{splittedResponseData.Length}]{responseData}";
                                 splittedResponseData[i] = null;
                                 goto buildMessage;
                             }
@@ -173,17 +212,14 @@ namespace DNS_Tunneling_Server
 
                     }
                 buildMessage:
-                    //{_Form1.richTextBox2.Text}";
 
                     byte[] SendBytes = ReciveBytes;
-
+                    //offsets wurden mithilfe von Wireschark herausgefunden
                     byte[] flag1 = { 0x81, 0x80 };
 
                     byte[] flag2 = { 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
 
-                    // byte[] ttl = { 0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x04 };  //A record
-
-                    byte[] ttl = { 0xC0, 0x0C, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, Convert.ToByte(strmessage1.Length + 1), Convert.ToByte(strmessage1.Length) };  //txt record
+                    byte[] txtRecordOffset = { 0xC0, 0x0C, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, Convert.ToByte(strmessage.Length + 1), Convert.ToByte(strmessage.Length) };
 
                     flag1.CopyTo(SendBytes, 2);
 
@@ -193,13 +229,13 @@ namespace DNS_Tunneling_Server
 
 
 
-                    byte[] replyMessage = new byte[strmessage1.Length];
+                    byte[] replyMessage = new byte[strmessage.Length];
 
-                    for (int b = 0; b < strmessage1.Length; b++)
+                    for (int b = 0; b < strmessage.Length; b++)
 
                     {
 
-                        replyMessage[b] = Convert.ToByte(strmessage1[b]);
+                        replyMessage[b] = Convert.ToByte(strmessage[b]);
 
                     }
 
@@ -207,17 +243,16 @@ namespace DNS_Tunneling_Server
                     {
                         SendBytes = SendBytes.ToList().GetRange(0, SendBytes.Length - 11).ToArray();
                     }
-                    SendBytes = SendBytes.Concat(ttl).Concat(replyMessage).ToArray();
-                    _Form1.richTextBox1.Text += recivedMessage + "\n";
-
+                    SendBytes = SendBytes.Concat(txtRecordOffset).Concat(replyMessage).ToArray();
+                 
+                    //Antwort an Tunneling-Client
                     listener.Send(SendBytes, SendBytes.Length, groupEP);
 
                 }
 
                 catch (Exception e)
                 {
-                    // MessageBox.Show(e.ToString());
-                    //  _Form1.richTextBox1.Text = Convert.ToString(e);
+                    
                 }
 
             }
@@ -230,38 +265,23 @@ namespace DNS_Tunneling_Server
             return domain.Split((char)6)[0].Remove((char)4);
         }
 
-        static string ReturnCleanASCII(string s)
-        {
-            s = s.Split((char)6)[0];
-            StringBuilder sb = new StringBuilder(s.Length);
-            foreach (char c in s)
-            {
-                if ((int)c > 127) // you probably don't want 127 either
-                    continue;
-                if ((int)c < 32)  // I bet you don't want control characters 
-                    continue;
-                if (c == ',')
-                    continue;
-                if (c == '"')
-                    continue;
-                sb.Append(c);
-            }
-            return sb.ToString();
-        }
 
-        static void PharseDomain(string request, out string messageID, out int messageNum, out int messagesCount, out string message)
+
+        static void PharseDomain(string request, out string streamID, out string messageID, out int messageNum, out int messagesCount, out string message)
         {
             StringBuilder sb = new StringBuilder(request.Length);
+            // Die Subdomains im DNS Protokoll werden nicht mit Punkte sondern mit unterschiedliche bytes geteilt die als Metadata dienen. 
+            // Da es für unsere zwecke nur störend ist, werden sie alle auf Punkt geändert.
             foreach (char c in request)
             {
                 if ((int)c > 127)
-                { // you probably don't want 127 either
+                { 
                     sb.Append('.');
                     continue;
                 }
 
                 if ((int)c < 32)
-                {   // I bet you don't want control characters 
+                {  
                     sb.Append('.');
                     continue;
                 }
@@ -277,9 +297,21 @@ namespace DNS_Tunneling_Server
 
                 sb.Append(c);
             }
-            request = sb.ToString().Remove(0, 1);
+            request = sb.ToString();
             string domain = $"{request.Split('.')[request.Split('.').Length - 2]}.{request.Split('.')[request.Split('.').Length - 1]}";
-            messageID = request.Split('.')[request.Split('.').Length - 4];
+            if (request.Split('.')[request.Split('.').Length - 4].Contains('-'))
+            {
+                messageID = request.Split('.')[request.Split('.').Length - 4].Split('-')[0];
+
+                streamID = request.Split('.')[request.Split('.').Length - 4].Split('-')[1];
+            }
+            else
+            {
+                messageID = request.Split('.')[request.Split('.').Length - 4];
+
+                streamID = "";
+            }
+         
             if (request.Split('.')[request.Split('.').Length - 3].Contains('-'))
             {
                 messageNum = int.Parse(request.Split('.')[request.Split('.').Length - 3].Split('-')[0]);
@@ -301,7 +333,7 @@ namespace DNS_Tunneling_Server
             message = null;
             if (messagesCount != 0)
             {
-                data = request.Replace($"{messageID}.{messageNum}-{messagesCount}.{domain}", "");
+                data = request.Replace($"{messageID}-{streamID}.{messageNum}-{messagesCount}.{domain}", "");
 
                 sb = new StringBuilder(data.Length);
                 foreach (char c in data)
@@ -332,7 +364,7 @@ namespace DNS_Tunneling_Server
         }
         static string getDomain(byte[] request)
         {
-            int i = 12;
+            int i = 13;
             string domain = "";
 
             while (!(request[i] == 0x00))
@@ -344,15 +376,6 @@ namespace DNS_Tunneling_Server
 
 
             return domain;
-        }
-        static byte[] SubDomToIPAddr(string domain)
-        {
-            byte[] byteip = new byte[4];
-            for (int b = 0; b < 4; b++)
-            {
-                //byteip[b] = Convert.ToByte(ipaddress.Split('.')[b]);
-            }
-            return byteip;
         }
 
     }
